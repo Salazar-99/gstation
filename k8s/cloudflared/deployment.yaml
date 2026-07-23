@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: cloudflared
+spec:
+  # One replica. A second would land on the same node anyway, so it never bought
+  # host redundancy - and the rollingUpdate below already keeps deploys seamless
+  # at replicas: 1, by starting the replacement and waiting for it to connect
+  # before retiring the old pod. The tradeoff is that an unexpected pod crash is
+  # a brief outage rather than a non-event; scale to 2 if that starts to matter.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudflared
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+      annotations:
+        # Roll the pods when the tunnel config changes; a ConfigMap edit alone
+        # does not restart anything, and cloudflared only reads it at startup.
+        checksum/config: "replace-me-or-run-kubectl-rollout-restart"
+    spec:
+      affinity:
+        podAntiAffinity:
+          # A no-op at replicas: 1, kept so that scaling up spreads pods instead
+          # of stacking them. Preferred, not required: on a one-node cluster a
+          # hard rule would leave every replica after the first Pending.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: cloudflared
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.7.2
+          args:
+            - tunnel
+            - --config
+            - /etc/cloudflared/config/config.yaml
+            - run
+          ports:
+            - name: metrics
+              containerPort: 2000
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cloudflared/config
+              readOnly: true
+            - name: creds
+              mountPath: /etc/cloudflared/creds
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: cloudflared
+        - name: creds
+          secret:
+            # Created out-of-band by the bootstrap in README.md. This is the
+            # tunnel's private credential and is deliberately not in git.
+            secretName: cloudflared-creds

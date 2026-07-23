@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared
+  namespace: cloudflared
+data:
+  # One catch-all rule: every request that arrives through the tunnel is handed
+  # to Traefik with its original Host header intact, and Traefik matches it
+  # against ordinary Ingress objects. Adding a site means adding an Ingress,
+  # not editing this file.
+  config.yaml: |
+    tunnel: gstation
+    credentials-file: /etc/cloudflared/creds/credentials.json
+
+    # Image tags pin the version; cloudflared must not rewrite its own binary.
+    no-autoupdate: true
+
+    # Scraped by the probes below.
+    metrics: 0.0.0.0:2000
+
+    ingress:
+      # Rules match top-down, first hit wins. Hostname-specific rules belong
+      # ABOVE the catch-all or they are unreachable.
+      #
+      # kubectl over the tunnel would go here. TCP mode is a raw byte pipe, so
+      # kubectl's client-cert TLS survives end-to-end -- but it is also an
+      # unauthenticated door to the API server until a Cloudflare Access
+      # application covers the hostname. Do not uncomment before that exists.
+      #
+      # - hostname: k8s.gerardosalazar.com
+      #   service: tcp://kubernetes.default.svc.cluster.local:443
+
+      - service: http://traefik.kube-system.svc.cluster.local:80

@@ -1,0 +1,151 @@
+# lima.yaml - single-node k3s VM for the gstation homelab.
+#
+# Derived from the upstream Lima k3s template, tuned for a machine that stays
+# up permanently rather than one that gets torn down after a test run:
+#   - Apple Virtualization framework (fastest VM backend on Apple Silicon)
+#   - sized for an always-on server instead of Lima's 4 CPU / 4 GiB default
+#   - ingress reachable from the LAN via port forwards on 0.0.0.0
+#   - k3s channel pinned so a rebuild doesn't silently jump minor versions
+#
+# Created by k8s.sh; not meant to be started by hand, but this works:
+#   limactl start --name=gstation ./lima.yaml --tty=false
+
+minimumLimaVersion: 2.0.0
+
+base: template:_images/ubuntu-lts
+
+# ---------------------------------------------------------------------------
+# VM sizing and platform
+# ---------------------------------------------------------------------------
+
+# "vz" is Apple's Virtualization framework - materially faster than QEMU on
+# Apple Silicon.
+vmType: vz
+
+# Rosetta (translating linux/amd64 binaries on this arm64 node) is deliberately
+# off. Nearly everything mainstream ships multi-arch, and Rosetta 2 is on a
+# deprecation clock - macOS 27 removes it on upgrade, macOS 28 ends it. The
+# tradeoff: an amd64-only image fails outright with "exec format error" here
+# rather than running slowly. To re-enable, install the host runtime first
+# (softwareupdate --install-rosetta --agree-to-license) and add:
+#
+# vmOpts:
+#   vz:
+#     rosetta:
+#       enabled: true
+#       binfmt: true
+
+cpus: 6
+memory: "16GiB"
+disk: "100GiB"
+
+# Apply pending distro updates on first boot. Costs a few minutes at create
+# time; worth it for a host that will be exposed to the LAN indefinitely.
+upgradePackages: true
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+
+# No host directories are shared into the VM, deliberately. Persistent volumes
+# live on the VM's own disk (k3s ships local-path-provisioner), because virtiofs
+# mounts have fsync and file-locking semantics that Postgres, SQLite and etcd
+# are entitled to be unhappy about. Back data *out* of the VM instead of
+# running it directly off the Mac's filesystem.
+mounts: []
+
+# containerd is installed and managed by k3s, so Lima must not also manage one.
+containerd:
+  system: false
+  user: false
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+
+# Lima auto-forwards guest ports bound to 0.0.0.0, but the defaults land on the
+# host's loopback and macOS still reserves ports below 1024 for root. These
+# rules put Traefik on the Mac's LAN address at high ports, and keep the
+# Kubernetes API on loopback where it is not worth exposing.
+portForwards:
+- guestPort: 80
+  hostPort: 8080
+  hostIP: "0.0.0.0"
+- guestPort: 443
+  hostPort: 8443
+  hostIP: "0.0.0.0"
+- guestPort: 6443
+  hostPort: 6443
+  hostIP: "127.0.0.1"
+
+# Optional upgrade path: give the VM its own address on the LAN (192.168.105.0/24
+# by default) so services can bind real :80/:443 and be addressed independently
+# of the Mac. Needs the socket_vmnet daemon installed root-owned, plus
+# `limactl sudoers`; see the notes k8s.sh prints at the end.
+#
+# networks:
+# - lima: shared
+
+# ---------------------------------------------------------------------------
+# k3s
+# ---------------------------------------------------------------------------
+
+param:
+  # Release channel passed to the k3s installer: "stable", "latest", or a
+  # specific line such as "v1.31". Pin this before you have workloads you care
+  # about; bumping it and re-running the installer is how you upgrade.
+  k3sChannel: "stable"
+  # Extra SAN baked into the API server certificate. Set this to the Mac's LAN
+  # IP or hostname if you ever want to point kubectl at the cluster from
+  # another machine; it must be present at install time, not added later.
+  tlsSan: ""
+
+provision:
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eu
+    # The installer is idempotent, but re-running it on every boot would also
+    # re-resolve the channel and can pull a new minor version underneath a
+    # running cluster. Install once; upgrades stay an explicit action.
+    if [ ! -d /var/lib/rancher/k3s ]; then
+      # 644 so the kubeconfig can be copied out without escalating.
+      K3S_EXEC="server --write-kubeconfig-mode 644"
+    {{- if .Param.tlsSan }}
+      K3S_EXEC="$K3S_EXEC --tls-san {{.Param.tlsSan}}"
+    {{- end }}
+      curl -sfL https://get.k3s.io \
+        | INSTALL_K3S_CHANNEL="{{.Param.k3sChannel}}" \
+          INSTALL_K3S_EXEC="$K3S_EXEC" \
+          sh -
+    fi
+
+probes:
+- mode: readiness
+  description: k3s to have written its kubeconfig
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    if ! timeout 300s bash -c "until test -f /etc/rancher/k3s/k3s.yaml; do sleep 3; done"; then
+      echo >&2 "k3s is not running yet"
+      exit 1
+    fi
+  hint: |
+    The k3s kubeconfig file has not yet been created.
+    Run "limactl shell gstation sudo journalctl -u k3s" to check the log.
+    If that is still empty, check the bottom of "/var/log/cloud-init-output.log".
+
+# Lima re-copies this on every start, so a rebuilt cluster's new credentials
+# land on the host automatically. k8s.sh reshapes it into ~/.kube/gstation.yaml.
+copyToHost:
+- guest: "/etc/rancher/k3s/k3s.yaml"
+  host: "{{.Dir}}/copied-from-guest/kubeconfig.yaml"
+  deleteOnStop: true
+
+message: |
+  The cluster's kubeconfig was copied to:
+    {{.Dir}}/copied-from-guest/kubeconfig.yaml
+
+  k8s.sh rewrites that into ~/.kube/gstation.yaml with a "gstation" context:
+    export KUBECONFIG="$HOME/.kube/config:$HOME/.kube/gstation.yaml"
+    kubectl --context gstation get nodes
