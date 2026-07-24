@@ -1,20 +1,16 @@
 # gstation
 
-Macbook as a homelab.
-
-A MacBook configured as an always-on, lid-closed server, running a single-node
-k3s cluster inside a Lima VM, published to the internet through a Cloudflare
-Tunnel.
+Scripts to configure a MacBook as an always-on, lid-closed server. It runs a single-node
+k3s cluster inside a Lima VM on my home network exposed to the internet through Cloudflare
+Tunnels.
 
 ```
-internet ─→ Cloudflare edge ─→ tunnel ─→ cloudflared pod ─→ Traefik ─→ your app
-                                              (k3s in a Lima VM on the MacBook)
-LAN ──────────────────────────────────────→ Traefik on <mac-ip>:8080 / :8443
-you ─────→ Cloudflare edge ─→ ssh tunnel ─→ cloudflared on the Mac ─→ sshd :22
+internet ─→ CF edge ─→ CF tunnel ─→ cloudflared pod ─→ Traefik ─→ apps
 ```
 
-No port forwarding, no static IP, no dynamic DNS: the tunnel dials outward, so
-the home router never needs an inbound hole.
+Cloudflare Tunnels prevent you from having to punch holes in your home network. This is accomplished through `cloudflared` running outbound traffic to route through.
+
+## Project Layout
 
 | File | Purpose |
 |---|---|
@@ -41,11 +37,14 @@ script detects this, tells you, and opens the settings pane — grant it and
 re-run. Everything else in `setup.sh` works without it.
 
 **Domain**
-- A domain already using Cloudflare's nameservers. `k8s.sh` defaults to
+
+A domain already using Cloudflare's nameservers. `k8s.sh` defaults to
   `gerardosalazar.com`; override with `DOMAIN=example.com ./k8s.sh`, and
   `TUNNEL_NAME=… ` to name the tunnel something other than `gstation`.
 
-**A Cloudflare API token**, exported as `CF_API_TOKEN`. Create it at
+**A Cloudflare API token** 
+
+Exported as `CF_API_TOKEN`. Create it at
 **dash.cloudflare.com → My Profile → API Tokens → Create Token → Custom**:
 
 | Scope | Why |
@@ -58,9 +57,6 @@ re-run. Everything else in `setup.sh` works without it.
 it half an hour into a VM build.
 
 Everything else — Lima, kubectl, helm, jq — is installed by the scripts.
-
-> **If the domain already serves a live site, read the DNS warning below before
-> running `k8s.sh`.** It repoints existing records at the tunnel.
 
 ## Deploying
 
@@ -83,10 +79,15 @@ reconcile in seconds.
 
 ### What `setup.sh` does
 
-Six verified steps: installs Homebrew and AlDente; disables idle sleep, disk
-sleep and user-initiated sleep on AC; enables Remote Login and Screen Sharing;
-installs a `caffeinate` LaunchDaemon as a backstop; and turns the application
-firewall on.
+Six verified steps:
+
+1. **Homebrew & AlDente** — installs Homebrew and AlDente
+2. **Power management** — disables idle sleep, disk sleep and user-initiated
+   sleep on AC
+3. **Remote access** — enables Remote Login and Screen Sharing
+4. **Keep-awake** — installs a `caffeinate` LaunchDaemon as a backstop
+5. **Firewall** — turns the application firewall on
+6. **Checklist** — prints what could not be automated
 
 Three things it deliberately leaves to you:
 
@@ -116,18 +117,6 @@ Nine verified steps:
 
 It exits non-zero if any check failed, and every failure line starts with
 `[FAIL]`.
-
-### DNS: this can take a live site down
-
-Step 7 reconciles `$DOMAIN` and `www.$DOMAIN` to proxied CNAMEs pointing at the
-tunnel. If a record already exists and points somewhere else, **it is
-repointed**, not skipped — the script warns loudly (`[WARN] … currently points
-at A 203.0.113.10`) but does not stop. Only address records (`CNAME`/`A`/`AAAA`)
-are touched; MX, TXT and CAA at the apex are left alone, so mail routing
-survives.
-
-If that is not what you want, run against a subdomain instead —
-`DOMAIN=lab.example.com ./k8s.sh`.
 
 ### Verifying
 
@@ -304,11 +293,7 @@ limactl start gstation
 
 Change `lima.yaml` too, or the next re-run reverts you.
 
-On a 48 GB machine, 16 GiB suits k3s plus a reasonable set of services and
-24–32 GiB is safe once databases are involved; `vmType: vz` grows toward the
-ceiling rather than reserving it up front. For CPUs, check `sysctl -n hw.ncpu`
-and leave at least a third to the host so the Mac stays responsive over Screen
-Sharing.
+Reserving about 2/3rds of the resources for the VM is safe.
 
 ## Re-running
 
@@ -361,27 +346,6 @@ A full uninstall/reinstall cycle:
 export CF_API_TOKEN=$(security find-generic-password -a "$USER" -s cloudflare-api-token -w)
 ./k8s.sh
 ```
-
-## Secrets
-
-None of them are in this repo:
-
-| Secret | Needed | Lives |
-|---|---|---|
-| `CF_API_TOKEN` | only while `k8s.sh` / `local-tunnel.sh` run | macOS Keychain |
-| cluster tunnel credentials | every pod start | the cluster, as a Secret |
-| SSH tunnel credentials | every `cloudflared` start | `~/.cloudflared/`, 0600 |
-
-The API token is not part of the steady-state deploy path. It provisions the
-tunnel once and converts its own authority into a credential the cluster holds;
-after that, redeploys and restarts need nothing from you. `k8s.sh` assembles
-the tunnel credential in a `mktemp` directory shredded on exit, and passes it to
-`kubectl` as a file rather than an argument so it never appears in `ps` output.
-
-If you later want the cluster reproducible from the repo alone — no Cloudflare
-token, no network — encrypt the Secret into git with SOPS + age. Prefer that
-over Sealed Secrets here: Sealed Secrets encrypts to a key held *inside* the
-cluster, and this cluster is a disposable VM.
 
 ## Serving something
 
