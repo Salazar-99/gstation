@@ -10,6 +10,7 @@ Tunnel.
 internet ─→ Cloudflare edge ─→ tunnel ─→ cloudflared pod ─→ Traefik ─→ your app
                                               (k3s in a Lima VM on the MacBook)
 LAN ──────────────────────────────────────→ Traefik on <mac-ip>:8080 / :8443
+you ─────→ Cloudflare edge ─→ ssh tunnel ─→ cloudflared on the Mac ─→ sshd :22
 ```
 
 No port forwarding, no static IP, no dynamic DNS: the tunnel dials outward, so
@@ -20,6 +21,8 @@ the home router never needs an inbound hole.
 | `setup.sh` | Configures macOS as a headless server: battery, power, sleep, SSH, VNC, firewall |
 | `lima.yaml` | The Lima VM definition and k3s install |
 | `k8s.sh` | Builds the cluster, provisions the tunnel, deploys cloudflared |
+| `local-tunnel.sh` | A second tunnel, run on the host, publishing this Mac's SSH |
+| `teardown.sh` | Removes everything `k8s.sh` created, so it can be rebuilt clean |
 | `k8s/cloudflared/` | Tunnel manifests — see [its README](k8s/cloudflared/README.md) |
 
 ## Requirements
@@ -102,7 +105,7 @@ Nine verified steps:
 
 1. **Tooling** — installs lima, kubectl, helm, jq; validates `lima.yaml`
 2. **VM** — creates or starts the Lima instance, confirms k3s is active
-3. **kubeconfig** — writes `~/.kube/gstation.yaml` with a `gstation` context
+3. **kubeconfig** — merges a `gstation` context into `~/.kube/config` (leaving any other contexts intact) and makes it current, so a bare `kubectl` just works
 4. **LaunchAgent** — restarts the VM after a reboot
 5. **Readiness** — waits for the node, coredns, local-path, metrics-server, Traefik
 6. **Tunnel** — finds or creates the Cloudflare tunnel, derives its credentials
@@ -128,14 +131,136 @@ If that is not what you want, run against a subdomain instead —
 
 ### Verifying
 
+`k8s.sh` merges the `gstation` context into `~/.kube/config` and makes it
+current, so no `KUBECONFIG` export is needed:
+
 ```sh
-export KUBECONFIG="$HOME/.kube/config:$HOME/.kube/gstation.yaml"
-kubectl --context gstation get nodes
+kubectl get nodes                                    # or: kubectl --context gstation …
 kubectl -n cloudflared logs -l app=cloudflared --tail=50
 ```
 
 A `healthy` tunnel means Cloudflare's edge is holding connections to the pod.
 It does **not** mean anything is served yet — see *Serving something*.
+
+## SSH from another machine
+
+`local-tunnel.sh` creates a **second, independent** tunnel — `gstation-ssh` —
+that reaches this Mac's own sshd. It has to be separate: the `gstation` tunnel
+runs *inside* k3s and only speaks HTTP to Traefik, and Cloudflare will not carry
+raw SSH over an HTTP hostname.
+
+Its `cloudflared` runs on the host under a `KeepAlive` LaunchAgent rather than in
+the cluster, so SSH still works when the VM is down — which is the whole point of
+a remote console.
+
+### Running it
+
+Authorize a key **first**; step 2 refuses to publish the hostname without one.
+
+```sh
+export CF_API_TOKEN=…        # same token and scopes as k8s.sh
+./local-tunnel.sh            # NOT with sudo - the LaunchAgent is per-user
+```
+
+Eight verified steps: installs cloudflared and jq; confirms sshd is listening and
+that `~/.ssh/authorized_keys` exists (0600 inside a 0700 directory) with at least
+one key in it; finds or creates the tunnel; reconciles a proxied CNAME for
+`ssh.$DOMAIN`; writes credentials and config into `~/.cloudflared/`; loads the
+LaunchAgent; and waits for Cloudflare to report the tunnel `healthy`.
+
+`CF_API_TOKEN` is read straight from the environment and the script exits if it
+is empty — nothing reads the Keychain, that is just a convenient way to fill the
+variable. Override `SSH_TUNNEL_NAME` or `SSH_HOSTNAME` to change the tunnel name
+or the published hostname.
+
+### Authorizing a key
+
+Step 2 creates `~/.ssh/authorized_keys` with the right modes if it is missing,
+then **hard-exits when it contains no keys**. Every other failed check in these
+scripts is counted and execution continues; this one stops, because the failure
+mode is not a broken tunnel but a working one — publishing the hostname with no
+key on the box leaves macOS's default `PasswordAuthentication yes` as the only
+thing between the internet and your home directory.
+
+From the client, over the LAN:
+
+```sh
+ssh-copy-id -i ~/.ssh/id_ed25519.pub gsalazar@10.0.0.34
+ssh -o PreferredAuthentications=publickey gsalazar@10.0.0.34 true
+```
+
+Forcing `publickey` on the verify matters — a plain `ssh` that quietly falls back
+to a password looks like success and proves nothing.
+
+**The key's filename matters.** OpenSSH only auto-offers `id_rsa`, `id_ecdsa`,
+`id_ed25519` and the `_sk` variants. A key named anything else — `id_rsa_gnode`,
+`id_work` — gets copied to the server happily by `ssh-copy-id` and is then never
+offered by `ssh`. The result is `Permission denied (publickey,…)` against a
+perfectly correct `authorized_keys`, which is a confusing thing to debug. Use a
+default name, or name the file in `~/.ssh/config`.
+
+### Client config
+
+`cloudflared` has to be installed on the client too — it is what dials the edge.
+
+```
+Host gstation
+  HostName 10.0.0.34
+  User gsalazar
+
+Host ssh.gerardosalazar.com
+  User gsalazar
+  ProxyCommand cloudflared access ssh --hostname %h
+```
+
+`User` is required whenever your account name differs between the two machines.
+If the key is not a default filename, add `IdentityFile ~/.ssh/<key>` and
+`IdentitiesOnly yes` to both entries — the `ProxyCommand` alone does not save you
+from the filename problem above.
+
+### Locking it down
+
+The hostname is an SSH door reachable from the whole internet. Cloudflare proxies
+the bytes but authenticates nobody by default, so sshd is the only gate until you
+add one.
+
+Once key auth is verified, turn passwords off:
+
+```sh
+printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
+  | sudo tee /etc/ssh/sshd_config.d/100-no-passwords.conf
+sudo launchctl kickstart -k system/com.openssh.sshd
+```
+
+Keep a session open while testing that, and authorize a second key before you do
+it — a bad sshd config plus a locked door is a trip to the physical keyboard.
+
+Then put a **Cloudflare Access** self-hosted app over the hostname: Zero Trust →
+Access → Applications → Add → Self-hosted, domain `ssh.$DOMAIN`, plus a policy
+allowing your email. One-time PIN works with no identity provider to configure.
+Access then authenticates you at the edge, before the SSH handshake ever reaches
+the Mac.
+
+That is a **dashboard-only change — nothing on this Mac changes**: not sshd, not
+cloudflared, not the tunnel. The client does not change either, since
+`cloudflared access ssh` already handles it, opening a browser on first connect
+and caching the token. The one variant that *would* touch the Mac is Access
+short-lived certificates, which replace `authorized_keys` with `TrustedUserCAKeys`
+in sshd_config.
+
+### Notes
+
+- `~/.cloudflared/gstation-ssh.json` is this tunnel's credential — a bearer secret
+  that anyone reading it can use to impersonate the tunnel. It is written 0600 in
+  a 0700 directory. Exclude `~/.cloudflared` from Time Machine if you would rather
+  it not be in backups. This is the one on-disk secret the setup cannot avoid,
+  precisely because cloudflared runs on the host rather than in the cluster.
+- **The two tunnels are entirely independent.** Deleting one never affects the
+  other, and `teardown.sh` does not know about `gstation-ssh` at all — remove it
+  by hand (`launchctl bootout`, the plist, `~/.cloudflared/`, and the tunnel and
+  its DNS record in the dashboard).
+- LAN SSH is unchanged and keeps working.
+- Same LaunchAgent caveat as the cluster: it fires at login, not at boot.
 
 ## Sizing the VM
 
@@ -201,26 +326,51 @@ To rebuild the cluster from scratch, keeping the tunnel and its DNS:
 limactl delete -f gstation && ./k8s.sh
 ```
 
-To tear the whole thing down, including the auto-start:
+## Uninstalling
 
 ```sh
-launchctl bootout "gui/$UID" ~/Library/LaunchAgents/com.local.lima-gstation.plist
-rm ~/Library/LaunchAgents/com.local.lima-gstation.plist
-limactl delete -f gstation
-rm ~/.kube/gstation.yaml
+./teardown.sh                 # VM, LaunchAgent, kubeconfig, logs
+./teardown.sh --yes           # skip the confirmation prompt
+./teardown.sh --cloudflare    # also delete the tunnel and its DNS records
+./teardown.sh --cache         # also drop Lima's downloaded image cache
 ```
 
-The Cloudflare tunnel and DNS records outlive that — delete those in the
-dashboard if you are done with them.
+It asks you to type the instance name before doing anything, and refuses to run
+non-interactively without `--yes`. Every step tolerates the thing already being
+gone, so it is safe to re-run.
+
+**The Cloudflare tunnel and DNS survive by default, and usually should.**
+`k8s.sh` finds the existing tunnel and recovers its secret from the API, so a
+rebuilt cluster comes back on the same hostnames with no DNS change at all.
+`--cloudflare` is for retiring the domain setup, not for rebuilding. When it is
+used, only records actually pointing at *this* tunnel are deleted — anything
+else at those hostnames is left alone.
+
+What it deliberately does **not** touch: the macOS server configuration from
+`setup.sh` (sleep, SSH, VNC, firewall, the keepawake daemon) and the Homebrew
+packages, which are general tools.
+
+Note that deleting the instance destroys its virtual disk, and every
+PersistentVolume with it — local-path-provisioner stores them inside the VM.
+Nothing there is recoverable afterwards.
+
+A full uninstall/reinstall cycle:
+
+```sh
+./teardown.sh --yes
+export CF_API_TOKEN=$(security find-generic-password -a "$USER" -s cloudflare-api-token -w)
+./k8s.sh
+```
 
 ## Secrets
 
-There are exactly two, and neither is in this repo:
+None of them are in this repo:
 
 | Secret | Needed | Lives |
 |---|---|---|
-| `CF_API_TOKEN` | only while `k8s.sh` runs | macOS Keychain |
-| tunnel credentials | every pod start | the cluster, as a Secret |
+| `CF_API_TOKEN` | only while `k8s.sh` / `local-tunnel.sh` run | macOS Keychain |
+| cluster tunnel credentials | every pod start | the cluster, as a Secret |
+| SSH tunnel credentials | every `cloudflared` start | `~/.cloudflared/`, 0600 |
 
 The API token is not part of the steady-state deploy path. It provisions the
 tunnel once and converts its own authority into a credential the cluster holds;
@@ -280,8 +430,9 @@ No `tls:` block and no cert-manager: TLS terminates at Cloudflare's edge.
 - **Persistent volumes live inside the VM** (local-path-provisioner, at
   `/var/lib/rancher/k3s/storage`). No host directory is mounted in, so back data
   *out* rather than expecting it on the Mac's filesystem.
-- **HTTP(S) only.** Raw TCP — SSH, Postgres, the Kubernetes API — needs a
-  separate tunnel rule plus `cloudflared access` on the client, or WARP.
+- **The cluster tunnel is HTTP(S) only.** Raw TCP — Postgres, the Kubernetes
+  API — needs its own tunnel rule plus `cloudflared access` on the client, or
+  WARP. SSH already has one: see *SSH from another machine*.
 - **Upload bodies are capped at the edge** (100 MB on the Free plan), and
   Cloudflare's ToS discourages bulk media streaming through the proxy.
 - **Set SSL/TLS mode to Full (strict)** in the Cloudflare dashboard. `Flexible`

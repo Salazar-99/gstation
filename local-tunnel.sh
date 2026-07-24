@@ -109,7 +109,7 @@ done
 echo
 
 # ---------------------------------------------------------------------------
-# 2. SSH is actually on
+# 2. SSH is actually on, and answers to a key
 #    The tunnel is a dead end if Remote Login is off. setup.sh turns it on;
 #    check rather than assume, since a failed TCC grant leaves it off silently.
 # ---------------------------------------------------------------------------
@@ -122,6 +122,49 @@ elif nc -z 127.0.0.1 22 >/dev/null 2>&1; then
 else
   fail "sshd is not listening on 127.0.0.1:22 - enable Remote Login (setup.sh does this)"
   echo "         System Settings > General > Sharing > Remote Login" >&2
+fi
+
+# sshd ignores an authorized_keys file that anyone but the owner can write, and
+# it does so silently - the client just falls back to the next auth method. So
+# the modes are set every run rather than only at creation.
+SSH_DIR="$HOME/.ssh"
+AUTH_KEYS="$SSH_DIR/authorized_keys"
+
+mkdir -p "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+[[ -f "$AUTH_KEYS" ]] || : > "$AUTH_KEYS"
+chmod 600 "$AUTH_KEYS"
+pass "$AUTH_KEYS exists (0600 in a 0700 directory)"
+
+# Blank lines and comments are not keys. grep -c exits 1 on no match, which
+# would otherwise take `set -e` down with it.
+KEY_COUNT="$(grep -cvE '^[[:space:]]*(#|$)' "$AUTH_KEYS" || true)"
+
+if [[ "${KEY_COUNT:-0}" -gt 0 ]]; then
+  pass "$KEY_COUNT authorized key(s) installed"
+else
+  # A hard stop, unlike the checks above. Everything else that fails here leaves
+  # a tunnel that does not work; this one would leave a tunnel that works far
+  # too well - publishing $SSH_HOSTNAME with no key on the box means the only
+  # thing between the internet and this Mac is macOS's default
+  # PasswordAuthentication yes. Refuse to open that door rather than warn about
+  # it after the fact.
+  fail "$AUTH_KEYS is empty - refusing to publish $SSH_HOSTNAME"
+  echo >&2
+  echo "  With no authorized key, sshd falls back to password auth, and this tunnel" >&2
+  echo "  would expose that prompt to the entire internet." >&2
+  echo >&2
+  echo "  From the machine you want to connect FROM, while both are on your LAN:" >&2
+  echo "    ssh-copy-id $USER@\$(ipconfig getifaddr en0)" >&2
+  echo >&2
+  echo "  Then turn passwords off on this Mac and restart sshd:" >&2
+  echo "    printf 'PasswordAuthentication no\\nKbdInteractiveAuthentication no\\n' \\" >&2
+  echo "      | sudo tee /etc/ssh/sshd_config.d/100-no-passwords.conf" >&2
+  echo "    sudo launchctl kickstart -k system/com.openssh.sshd" >&2
+  echo >&2
+  echo "  Verify key-only login works over the LAN, keeping a session open, then" >&2
+  echo "  re-run this script." >&2
+  exit 1
 fi
 echo
 

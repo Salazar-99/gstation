@@ -35,7 +35,7 @@ fail() { echo "  [FAIL] $*" >&2; FAILURES=$((FAILURES + 1)); }
 VM_NAME="gstation"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="$SCRIPT_DIR/lima.yaml"
-KUBECONFIG_OUT="$HOME/.kube/${VM_NAME}.yaml"
+KUBECONFIG_OUT="$HOME/.kube/config"
 AGENT_LABEL="com.local.lima-${VM_NAME}"
 AGENT_PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
 AGENT_LOG="$HOME/Library/Logs/lima-${VM_NAME}.log"
@@ -214,9 +214,10 @@ echo
 
 # ---------------------------------------------------------------------------
 # 3. kubeconfig
-#    The file Lima copies out names its cluster, user and context all "default",
-#    which collides with anything else already in ~/.kube. Rebuild it under the
-#    instance name rather than merging the collision into the main config.
+#    The file Lima copies out names its cluster, user and context all "default".
+#    Rebuild those under the instance name so they cannot collide, then merge
+#    into the default ~/.kube/config - so a bare `kubectl` finds the cluster
+#    with no KUBECONFIG juggling - preserving any other contexts already there.
 # ---------------------------------------------------------------------------
 echo "==> 3. kubeconfig"
 
@@ -230,7 +231,8 @@ else
 
   mkdir -p "$(dirname "$KUBECONFIG_OUT")"
   umask 077
-  cat > "$KUBECONFIG_OUT" <<EOF
+  NEW_CFG="$(mktemp)"
+  cat > "$NEW_CFG" <<EOF
 apiVersion: v1
 kind: Config
 clusters:
@@ -250,9 +252,17 @@ contexts:
     user: ${VM_NAME}
 current-context: ${VM_NAME}
 EOF
+
+  # Merge into ~/.kube/config without clobbering other contexts. The fresh file
+  # goes first in the chain so rotated certs and current-context win over any
+  # stale gstation entry from a previous run; a missing target file is ignored.
+  MERGED="$(mktemp)"
+  KUBECONFIG="$NEW_CFG:$KUBECONFIG_OUT" kubectl config view --flatten > "$MERGED"
+  mv "$MERGED" "$KUBECONFIG_OUT"
+  rm -f "$NEW_CFG"
   chmod 600 "$KUBECONFIG_OUT"
   [[ "$(kubectl --kubeconfig="$KUBECONFIG_OUT" config current-context 2>/dev/null)" == "$VM_NAME" ]] \
-    && pass "wrote $KUBECONFIG_OUT (context '$VM_NAME')" \
+    && pass "merged context '$VM_NAME' into $KUBECONFIG_OUT (now current)" \
     || fail "kubeconfig at $KUBECONFIG_OUT is not usable"
 fi
 echo
@@ -588,8 +598,7 @@ echo " Kubeconfig: $KUBECONFIG_OUT"
 echo " Tunnel:     ${TUNNEL_NAME}${TUNNEL_ID:+ ($TUNNEL_ID)}"
 echo " Published:  ${HOSTNAMES[*]}"
 echo
-echo "   export KUBECONFIG=\"\$HOME/.kube/config:$KUBECONFIG_OUT\""
-echo "   kubectl --context $VM_NAME get nodes"
+echo "   kubectl get nodes    # '$VM_NAME' is merged into ~/.kube/config as the current context"
 echo "=================================================================="
 
 exit $(( FAILURES > 0 ? 1 : 0 ))
